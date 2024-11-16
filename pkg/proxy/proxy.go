@@ -3,9 +3,13 @@ package proxy
 
 import (
 	ctx "context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -60,6 +64,7 @@ type Proxy struct {
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview
 	secureServingInfo     *server.SecureServingInfo
 	auditor               *audit.Audit
+	dynamicClientCert     *DynamicCertificate
 
 	restConfig            *rest.Config
 	clientTransport       http.RoundTripper
@@ -82,6 +87,54 @@ func (caFromFile CAFromFile) CurrentCABundleContent() []byte {
 	return res
 }
 
+// DynamicCertificate wraps DynamicCertKeyPairContent so that we can attach a function to it that can be used by
+// the TLS client config to load the client certificate dynamically
+type DynamicCertificate struct {
+	*dynamiccertificates.DynamicCertKeyPairContent
+}
+
+// GetClientCertificate returns a client certificate based on the most recent certificate and key data loaded from the
+// file system.
+func (c *DynamicCertificate) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	certBytes, keyBytes := c.CurrentCertKeyContent()
+	cert, err := tls.X509KeyPair(certBytes, keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load OIDC client certificate: %w", err)
+	}
+	return &cert, nil
+}
+
+// NewDynamicCertificate create a new instance of DynamicCertificate using the supplied certificate and key files
+func NewDynamicCertificate(purpose, certFile, keyFile string) (*DynamicCertificate, error) {
+	content, err := dynamiccertificates.NewDynamicServingContentFromFiles(purpose, certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new dynamic serving content for '%s': %w", purpose, err)
+	}
+	return &DynamicCertificate{content}, nil
+}
+
+// setupClient creates an HTTP client using the dynamic content provided for the client certificate and the CA bundle.
+// This function is based on how the setup would have been set up by the underlying OIDC code had we not passed in our
+// own client.
+func setupClient(dynamicClientCert *DynamicCertificate, caFromFile oidc.CAContentProvider) (*http.Client, error) {
+	var roots *x509.CertPool
+	if caFromFile != nil {
+		roots = x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caFromFile.CurrentCABundleContent()) {
+			return nil, fmt.Errorf("failed to append OIDC ca bundle to pool")
+		}
+	} else {
+		klog.Info("OIDC: No x509 certificates provided, will use host's root CA set")
+	}
+
+	// Copied from http.DefaultTransport.
+	tr := net.SetTransportDefaults(&http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots, GetClientCertificate: dynamicClientCert.GetClientCertificate},
+	})
+
+	return &http.Client{Transport: tr, Timeout: 30 * time.Second}, nil
+}
+
 func New(restConfig *rest.Config,
 	oidcOptions *options.OIDCAuthenticationOptions,
 	auditOptions *options.AuditOptions,
@@ -89,6 +142,7 @@ func New(restConfig *rest.Config,
 	subjectAccessReviewer *subjectaccessreview.SubjectAccessReview,
 	ssinfo *server.SecureServingInfo,
 	config *Config) (*Proxy, error) {
+	var err error
 
 	// load the CA from the file listed in the options
 	caFromFile := CAFromFile{
@@ -115,13 +169,32 @@ func New(restConfig *rest.Config,
 		},
 	}
 
-	// generate tokenAuther from oidc config
-	tokenAuther, err := oidc.New(ctx.TODO(), oidc.Options{
+	tokenAutherOptions := oidc.Options{
 		CAContentProvider: caFromFile,
 		//RequiredClaims:       oidcOptions.RequiredClaims,
 		SupportedSigningAlgs: oidcOptions.SigningAlgs,
 		JWTAuthenticator:     jwtConfig,
-	})
+	}
+
+	var dyCert *DynamicCertificate
+	if oidcOptions.ClientCertKey.CertFile != "" {
+		// Use the client certificate and key to enable mTLS
+		dyCert, err = NewDynamicCertificate("oidc-client", oidcOptions.ClientCertKey.CertFile, oidcOptions.ClientCertKey.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize OIDC client certificate loader: %v", err)
+		}
+
+		client, err := setupClient(dyCert, caFromFile)
+		if err != nil {
+			return nil, err
+		}
+
+		tokenAutherOptions.Client = client
+		tokenAutherOptions.CAContentProvider = nil
+	}
+
+	// generate tokenAuther from oidc config
+	tokenAuther, err := oidc.New(ctx.TODO(), tokenAutherOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +214,7 @@ func New(restConfig *rest.Config,
 		oidcRequestAuther:     bearertoken.New(tokenAuther),
 		tokenAuther:           tokenAuther,
 		auditor:               auditor,
+		dynamicClientCert:     dyCert,
 	}, nil
 }
 
@@ -151,6 +225,13 @@ func (p *Proxy) Run(stopCh <-chan struct{}) (<-chan struct{}, <-chan struct{}, e
 		return nil, nil, err
 	}
 	p.clientTransport = clientRT
+
+	if p.dynamicClientCert != nil {
+		// Start monitoring the OIDC client TLS certificate
+		c, cancel := ctx.WithCancel(ctx.Background())
+		defer cancel()
+		go p.dynamicClientCert.Run(c, 1)
+	}
 
 	// No auth round tripper for no impersonation
 	if p.config.DisableImpersonation || p.config.TokenReview {
